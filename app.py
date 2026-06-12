@@ -1,3 +1,9 @@
+import os
+import sys
+
+# Ensure the current directory is in sys.path so modules like supabase_client can be found
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from flask import Flask
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager
@@ -65,11 +71,11 @@ def create_app():
 
     return app
 
+# Expose the WSGI app object globally for Gunicorn and Waitress
+app = create_app()
 
 if __name__ == "__main__":
     import sys
-
-    app = create_app()
 
     if "--debug" in sys.argv:
         # Development mode with auto-reload
