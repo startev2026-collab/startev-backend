@@ -1,6 +1,7 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt
 from supabase_client import get_supabase_admin_client
+from cloudinary_utils import upload_image
 
 bikes_bp = Blueprint("bikes", __name__)
 db = get_supabase_admin_client()
@@ -43,7 +44,11 @@ def create_bike():
     if claims.get("role") != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
-    data = request.get_json()
+    if request.content_type and "multipart/form-data" in request.content_type:
+        data = request.form.to_dict()
+    else:
+        data = request.get_json()
+
     required = ["bike_number", "bike_model", "store_id", "daily_price", "weekly_price", "monthly_price"]
     for field in required:
         if not data.get(field) and data.get(field) != 0:
@@ -59,6 +64,14 @@ def create_bike():
     if not store.data:
         return jsonify({"error": "Store not found"}), 404
 
+    image_url = data.get("image_url", "")
+    if request.files.get("image"):
+        try:
+            res = upload_image(request.files["image"].read(), folder="bike_rental/bikes")
+            image_url = res["url"]
+        except Exception as e:
+            return jsonify({"error": f"Failed to upload bike image: {str(e)}"}), 500
+
     bike_data = {
         "bike_number": data["bike_number"],
         "bike_model": data["bike_model"],
@@ -68,7 +81,7 @@ def create_bike():
         "weekly_price": float(data["weekly_price"]),
         "monthly_price": float(data["monthly_price"]),
         "status": data.get("status", "available"),
-        "image_url": data.get("image_url", ""),
+        "image_url": image_url,
     }
 
     result = db.table("bikes").insert(bike_data).execute()
@@ -88,7 +101,19 @@ def update_bike(bike_id):
     if claims.get("role") != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
-    data = request.get_json()
+    if request.content_type and "multipart/form-data" in request.content_type:
+        data = request.form.to_dict()
+    else:
+        data = request.get_json()
+
+    # If image is uploaded as file
+    if request.files.get("image"):
+        try:
+            res = upload_image(request.files["image"].read(), folder="bike_rental/bikes")
+            data["image_url"] = res["url"]
+        except Exception as e:
+            return jsonify({"error": f"Failed to upload bike image: {str(e)}"}), 500
+
     allowed = ["bike_model", "bike_type", "store_id", "daily_price", "weekly_price",
                "monthly_price", "status", "image_url"]
     update_data = {}

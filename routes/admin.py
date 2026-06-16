@@ -270,6 +270,11 @@ def delete_user(user_id):
         return jsonify({"error": "Unauthorized"}), 403
 
     try:
+        # Check if the user has any active or expired rentals (meaning they haven't returned the bike yet)
+        active_rentals = db.table("rentals").select("id").eq("user_id", user_id).in_("rental_status", ["active", "expired"]).execute()
+        if active_rentals.data:
+            return jsonify({"error": "Cannot delete customer with active or expired rentals. Please mark the rentals as returned first."}), 409
+
         db.table("users").delete().eq("id", user_id).execute()
         return jsonify({"message": "User deleted successfully"}), 200
     except Exception as e:
