@@ -194,11 +194,10 @@ def get_store_users():
 
     store_id = claims.get("store_id")
 
-    # 1. Get user_ids from rentals for this store
-    rentals = db.table("rentals").select("user_id").eq("store_id", store_id).execute()
-    rental_user_ids = [r["user_id"] for r in rentals.data]
+    # Get users registered at this store via the store_id field on the user record
+    store_users = db.table("users").select("*").eq("store_id", store_id).order("created_at", desc=True).execute()
 
-    # 2. Get user_ids from audit_logs registered by this store
+    # Also get user_ids from audit_logs registered by this store (fallback for older records)
     registrations = (
         db.table("audit_logs")
         .select("entity_id")
@@ -209,16 +208,16 @@ def get_store_users():
     )
     registered_user_ids = [r["entity_id"] for r in registrations.data]
 
-    # Combine distinct user IDs
-    user_ids = list(set(rental_user_ids + registered_user_ids))
+    # Combine: users already from store_id field + any from audit_logs not yet included
+    store_user_ids = {u["id"] for u in store_users.data}
+    extra_ids = [uid for uid in registered_user_ids if uid not in store_user_ids]
 
-    if not user_ids:
-        return jsonify({"users": []})
+    extra_users = []
+    if extra_ids:
+        extra_result = db.table("users").select("*").in_("id", extra_ids).order("created_at", desc=True).execute()
+        extra_users = extra_result.data
 
-    # Fetch those users
-    result = db.table("users").select("*").in_("id", user_ids).order("created_at", desc=True).execute()
-    
-    users = result.data
+    users = store_users.data + extra_users
     for user in users:
         user.pop("password_hash", None)
 
