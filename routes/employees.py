@@ -194,10 +194,7 @@ def get_store_users():
 
     store_id = claims.get("store_id")
 
-    # Get users registered at this store via the store_id field on the user record
-    store_users = db.table("users").select("*").eq("store_id", store_id).order("created_at", desc=True).execute()
-
-    # Also get user_ids from audit_logs registered by this store (fallback for older records)
+    # Get user_ids registered at this store via audit_logs
     registrations = (
         db.table("audit_logs")
         .select("entity_id")
@@ -206,18 +203,15 @@ def get_store_users():
         .eq("details", store_id)
         .execute()
     )
-    registered_user_ids = [r["entity_id"] for r in registrations.data]
+    registered_user_ids = list(set(r["entity_id"] for r in registrations.data))
 
-    # Combine: users already from store_id field + any from audit_logs not yet included
-    store_user_ids = {u["id"] for u in store_users.data}
-    extra_ids = [uid for uid in registered_user_ids if uid not in store_user_ids]
+    if not registered_user_ids:
+        return jsonify({"users": []})
 
-    extra_users = []
-    if extra_ids:
-        extra_result = db.table("users").select("*").in_("id", extra_ids).order("created_at", desc=True).execute()
-        extra_users = extra_result.data
+    # Fetch those users
+    result = db.table("users").select("*").in_("id", registered_user_ids).order("created_at", desc=True).execute()
 
-    users = store_users.data + extra_users
+    users = result.data
     for user in users:
         user.pop("password_hash", None)
 
