@@ -1,14 +1,31 @@
 import os
-import requests
+import hashlib
 import time
 import re
+import uuid
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, redirect
 from flask_jwt_extended import jwt_required, get_jwt
 from supabase_client import get_supabase_admin_client
 
 payments_bp = Blueprint("payments", __name__)
 db = get_supabase_admin_client()
+
+PAYU_MERCHANT_KEY = os.environ.get("PAYU_MERCHANT_KEY", "DfBuMo")
+PAYU_SALT = os.environ.get("PAYU_SALT", "Fr8sL4n35BF6fs0rGBjtveZJJ3quEJ3b")
+PAYU_ENV = os.environ.get("PAYU_ENV", "sandbox")
+PAYU_BASE_URL = "https://test.payu.in/_payment" if PAYU_ENV == "sandbox" else "https://secure.payu.in/_payment"
+
+
+def generate_payu_hash(txnid, amount, productinfo, firstname, email, udf1="", udf2="", udf3="", udf4="", udf5=""):
+    hash_string = f"{PAYU_MERCHANT_KEY}|{txnid}|{amount}|{productinfo}|{firstname}|{email}|{udf1}|{udf2}|{udf3}|{udf4}|{udf5}||||||{PAYU_SALT}"
+    return hashlib.sha512(hash_string.encode()).hexdigest()
+
+
+def verify_payu_response(data):
+    expected = f"{PAYU_SALT}|{data.get('status', '')}||||||{data.get('udf5', '')}|{data.get('udf4', '')}|{data.get('udf3', '')}|{data.get('udf2', '')}|{data.get('udf1', '')}|{data.get('email', '')}|{data.get('firstname', '')}|{data.get('productinfo', '')}|{data.get('amount', '')}|{data.get('txnid', '')}|{PAYU_MERCHANT_KEY}"
+    return hashlib.sha512(expected.encode()).hexdigest() == data.get("hash", "")
+
 
 @payments_bp.route("", methods=["GET"])
 @jwt_required()
@@ -26,7 +43,6 @@ def list_payments():
 
     result = query.order("payment_date", desc=True).execute()
 
-    # Filter by store_id if provided (needs post-query filter due to nested join)
     payments = result.data
     if store_id:
         payments = [p for p in payments if p.get("rentals", {}).get("store_id") == store_id]
@@ -37,16 +53,13 @@ def list_payments():
 @payments_bp.route("/create-order", methods=["POST"])
 @jwt_required()
 def create_order():
-    """
-    Create a Cashfree order.
-    """
+    """Generate PayU payment hash and return form params."""
     claims = get_jwt()
     if claims.get("role") != "user":
         return jsonify({"error": "Unauthorized"}), 401
 
     user_id = claims["user_id"]
 
-    # Block order creation if user already has an active rental
     data = request.get_json()
     payment_type = data.get("payment_type", "rental")
 
@@ -65,8 +78,6 @@ def create_order():
             }), 409
 
     amount = float(data.get("amount", 0))
-    currency = data.get("currency", "INR")
-    
     if amount < 1.00:
         return jsonify({"error": "Minimum amount is 1 INR"}), 400
 
@@ -75,65 +86,41 @@ def create_order():
         if not user_res.data:
             return jsonify({"error": "User not found"}), 404
         user_info = user_res.data[0]
-        
+
         user_phone = user_info.get("phone") or "9999999999"
-        # clean phone number to contain only digits, max 10 digits
         user_phone = re.sub(r'\D', '', user_phone)
         if len(user_phone) > 10:
             user_phone = user_phone[-10:]
         elif len(user_phone) < 10:
             user_phone = "9999999999"
-            
+
         user_email = user_info.get("email") or "user@example.com"
         user_name = user_info.get("name") or "User"
 
-        app_id = os.environ.get("CASHFREE_APP_ID")
-        secret_key = os.environ.get("CASHFREE_SECRET_KEY")
-        env = os.environ.get("CASHFREE_ENV", "sandbox")
-        
-        if not app_id or not secret_key:
-            return jsonify({"error": "Cashfree credentials not configured"}), 500
-            
-        base_url = "https://sandbox.cashfree.com/pg" if env == "sandbox" else "https://api.cashfree.com/pg"
-        
-        headers = {
-            "x-client-id": app_id,
-            "x-client-secret": secret_key,
-            "x-api-version": "2023-08-01",
-            "Content-Type": "application/json"
-        }
-        
-        order_id = f"order_{int(time.time() * 1000)}"
-        
-        # Let's get the origin header for return_url
-        origin = request.headers.get("Origin") or "http://localhost:5173"
-        return_url = f"{origin}/dashboard?order_id={{order_id}}"
-        
-        payload = {
-            "order_id": order_id,
-            "order_amount": float(amount),
-            "order_currency": currency,
-            "customer_details": {
-                "customer_id": str(user_id),
-                "customer_email": user_email,
-                "customer_phone": user_phone,
-                "customer_name": user_name
-            },
-            "order_meta": {
-                "return_url": return_url
-            }
-        }
+        txnid = f"T{int(time.time() * 1000)}{uuid.uuid4().hex[:6].upper()}"
+        productinfo = f"EV Bike Rental - {payment_type.capitalize()}"
+        udf1 = payment_type
 
-        response = requests.post(f"{base_url}/orders", json=payload, headers=headers)
-        if response.status_code != 200:
-            return jsonify({"error": f"Failed to create order: {response.text}"}), response.status_code
-            
-        order_data = response.json()
+        hash_value = generate_payu_hash(txnid, amount, productinfo, user_name, user_email, udf1)
+
+        origin = request.headers.get("Origin") or "http://localhost:5173"
+        backend_url = os.environ.get("BACKEND_URL", "https://startev-backend.onrender.com")
+        surl = f"{backend_url}/api/payments/callback?origin={origin}"
+        furl = f"{backend_url}/api/payments/callback?origin={origin}"
+
         return jsonify({
-            "order_id": order_data["order_id"],
-            "payment_session_id": order_data["payment_session_id"],
-            "amount": order_data["order_amount"],
-            "currency": order_data["order_currency"]
+            "txnid": txnid,
+            "amount": str(amount),
+            "productinfo": productinfo,
+            "firstname": user_name,
+            "email": user_email,
+            "phone": user_phone,
+            "hash": hash_value,
+            "key": PAYU_MERCHANT_KEY,
+            "surl": surl,
+            "furl": furl,
+            "action": PAYU_BASE_URL,
+            "udf1": udf1,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -142,67 +129,71 @@ def create_order():
 @payments_bp.route("/verify-payment", methods=["POST"])
 @jwt_required()
 def verify_payment():
-    """
-    Verify payment completion via Cashfree order status API.
-    """
+    """Verify PayU response hash."""
     claims = get_jwt()
     if claims.get("role") != "user":
         return jsonify({"error": "Unauthorized"}), 401
 
-    user_id = claims["user_id"]
     data = request.get_json()
-    order_id = data.get("order_id")
-    
-    if not order_id:
-        return jsonify({"error": "Missing order_id"}), 400
-        
-    app_id = os.environ.get("CASHFREE_APP_ID")
-    secret_key = os.environ.get("CASHFREE_SECRET_KEY")
-    env = os.environ.get("CASHFREE_ENV", "sandbox")
-    
-    if not app_id or not secret_key:
-        return jsonify({"error": "Cashfree credentials not configured"}), 500
-        
-    base_url = "https://sandbox.cashfree.com/pg" if env == "sandbox" else "https://api.cashfree.com/pg"
-    
-    headers = {
-        "x-client-id": app_id,
-        "x-client-secret": secret_key,
-        "x-api-version": "2023-08-01"
-    }
-    
-    try:
-        # 1. Fetch order details from Cashfree
-        order_res = requests.get(f"{base_url}/orders/{order_id}", headers=headers)
-        if order_res.status_code != 200:
-            return jsonify({"error": f"Failed to fetch order: {order_res.text}"}), order_res.status_code
-            
-        order_data = order_res.json()
-        
-        # 2. Check if the payment status is PAID
-        if order_data.get("order_status") != "PAID":
-            return jsonify({"error": f"Payment not completed. Status: {order_data.get('order_status')}"}), 400
-            
-        # 3. Security Check: verify customer_id matches user_id
-        customer_details = order_data.get("customer_details", {})
-        if str(customer_details.get("customer_id")) != str(user_id):
-            return jsonify({"error": "Security check failed: user ID mismatch"}), 403
-            
-        # 4. Fetch payments for this order to find the successful transaction ID
-        payments_res = requests.get(f"{base_url}/orders/{order_id}/payments", headers=headers)
-        transaction_id = order_id  # Default fallback
-        if payments_res.status_code == 200:
-            payments = payments_res.json()
-            for payment in payments:
-                if payment.get("payment_status") == "SUCCESS":
-                    transaction_id = payment.get("cf_payment_id") or transaction_id
-                    break
-                    
-        return jsonify({
-            "verified": True,
-            "transaction_id": transaction_id,
-            "message": "Payment verified successfully"
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    txnid = data.get("txnid", "")
+    status = data.get("status", "")
+    payu_hash = data.get("hash", "")
 
+    if not txnid or not status or not payu_hash:
+        return jsonify({"error": "Missing payment verification data"}), 400
+
+    verified = verify_payu_response({
+        "txnid": txnid,
+        "status": status,
+        "hash": payu_hash,
+        "amount": data.get("amount", "0"),
+        "productinfo": data.get("productinfo", ""),
+        "firstname": data.get("firstname", ""),
+        "email": data.get("email", ""),
+        "udf1": data.get("udf1", ""),
+        "udf2": data.get("udf2", ""),
+        "udf3": data.get("udf3", ""),
+        "udf4": data.get("udf4", ""),
+        "udf5": data.get("udf5", ""),
+    })
+
+    if not verified or status != "success":
+        return jsonify({"verified": False, "error": "Payment verification failed"}), 400
+
+    return jsonify({
+        "verified": True,
+        "transaction_id": txnid,
+        "message": "Payment verified successfully"
+    })
+
+
+@payments_bp.route("/callback", methods=["POST"])
+def payment_callback():
+    """Receive PayU POST callback and redirect to frontend."""
+    data = request.form.to_dict()
+    verified = verify_payu_response(data)
+
+    if verified and data.get("status") == "success":
+        status = "success"
+    else:
+        status = "failure"
+
+    origin = request.args.get("origin") or "http://localhost:5173"
+    redirect_url = (
+        f"{origin}/payment-callback"
+        f"?status={status}"
+        f"&txnid={data.get('txnid', '')}"
+        f"&amount={data.get('amount', '0')}"
+        f"&payment_type={data.get('udf1', '')}"
+        f"&productinfo={data.get('productinfo', '')}"
+        f"&firstname={data.get('firstname', '')}"
+        f"&email={data.get('email', '')}"
+        f"&hash={data.get('hash', '')}"
+        f"&udf1={data.get('udf1', '')}"
+        f"&udf2={data.get('udf2', '')}"
+        f"&udf3={data.get('udf3', '')}"
+        f"&udf4={data.get('udf4', '')}"
+        f"&udf5={data.get('udf5', '')}"
+    )
+
+    return redirect(redirect_url)
